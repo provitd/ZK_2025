@@ -1,0 +1,520 @@
+---
+title: "scRNA_seq"
+format: html
+editor: visual
+toc: true
+---
+
+# Set up 
+```{r}
+library(here)
+library(glue)
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(HGNChelper)
+library(openxlsx)
+source(here("utils/sctype_wrapper.R"))
+
+
+dir <- "scRNA_seq/"
+
+# Create directories
+directories <- c(here(dir, "rds"))
+sapply(directories, function(x){dir.create(x, showWarnings = FALSE, recursive = TRUE)})
+
+```
+
+## Process: QC to UMAP
+
+The aim is to process and integrate WT, MT and ZK samples, following Seurat vignette.
+
+```{r}
+# Name and path of datasets dir
+list_seurat <- list(
+  # WT
+  "WT" = list(
+    condition = "WT",
+    data.dir = here(dir, "data/S22096/MNGC484_filtered_feature_bc_matrix/")),
+  # Cyp24a1 null 10 weeks
+  "MT" = list(
+    condition = "MT",
+    data.dir = here(dir, "data/S22096/MNGC485_filtered_feature_bc_matrix/")),
+  # ZK-treated Cyp24a1 null 10 weeks
+  "ZK" = list(
+    condition = "ZK",
+    data.dir = here(dir, "data/S22096/MNGC486_filtered_feature_bc_matrix/"))
+)
+
+# Creation of Seurat objects
+list_seurat <- lapply(list_seurat, function(x){
+  # Load the data
+  data <- Read10X(data.dir = x$data.dir)
+  seurat <- CreateSeuratObject(data,
+                               project = x$condition,
+                               assay = "RNA",
+                               min.cells = 10,
+                               min.features = 100,
+                               names.field = 1,
+                               names.delim = "_",
+                               meta.data = NULL
+  )
+  # Add percent.mt feature
+  feature <- list(col.name = "percent.mt",
+                  pattern = "^MT-|^mt-|^Mt-")
+
+  seurat <- PercentageFeatureSet(object = seurat,
+                                 col.name = feature$col.name,
+                                 pattern = feature$pattern)
+
+  feature <- list(col.name = "percent.ribo",
+                  pattern = "^Rp[sl][[:digit:]]|^Rp[[:digit:]]|^Rpsa")
+
+  seurat <- PercentageFeatureSet(object = seurat,
+                                 col.name = feature$col.name,
+                                 pattern = feature$pattern)
+
+  # Save VlnPlot of unfiltered data
+  VlnPlot(seurat, features = c("nFeature_RNA", "nCount_RNA", 
+                               "percent.mt", "percent.ribo"),
+          pt.size = 1, ncol = 3)
+
+  # Filter data
+  seurat <- subset(seurat, subset = nFeature_RNA > 100 &
+                     nFeature_RNA < 7000 &
+                     percent.mt < 50)
+
+  # Save VlnPlot of filtered data
+  VlnPlot(seurat, features = c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.ribo"),
+          pt.size = 1, ncol = 3)
+
+  return(seurat)
+})
+
+# Integration of WT, MT and ZK objects
+
+# Creation of the combined Seurat object
+seurat <- merge(x = list_seurat$WT,
+                y = list_seurat[c("MT", "ZK")])
+# Normalize each object
+seurat <- NormalizeData(seurat)
+seurat <- FindVariableFeatures(seurat,
+                               selection.method = "vst",
+                               nfeatures = 2000)
+
+seurat <- ScaleData(seurat, verbose = F)
+seurat <- RunPCA(seurat, verbose = F)
+# Integrate the datasets
+seurat <- IntegrateLayers(seurat, method = CCAIntegration,
+                          orig = "pca", new.reduction = "integrated.cca",
+                          verbose = T)
+# Cluster the integrated data
+seurat <- FindNeighbors(seurat, reduction = "integrated.cca", dims = 1:30)
+seurat <- FindClusters(seurat, resolution =  0.8)
+
+seurat <- RunUMAP(seurat, reduction = "integrated.cca",
+                  dims = 1:30, return.model = T, verbose = F)
+
+# Create common counts and data layers
+# seurat <- JoinLayers(seurat)
+
+DimPlot(seurat, group.by = "orig.ident", reduction = "umap")
+DimPlot(seurat, split.by = "orig.ident", 
+        group.by = "seurat_clusters", reduction = "umap")
+
+DefaultAssay(seurat) <- "RNA"
+saveRDS(seurat, here(dir, "rds", "WT_MT_ZK_seurat.rds"))
+```
+
+## Annotate
+
+The aim is to annotate clusters, with ScType tool (https://www.nature.com/articles/s41467-022-28803-w), based on Novella-Rausell et al. kidney markers (https://doi.org/10.1016/j.isci.2023.106877)
+
+```{r}
+seurat <- readRDS(here(dir, "rds", "WT_MT_ZK_seurat.rds"))
+tissue = "Kidney"
+
+# Create marker table in sctype format 
+create_markers_table <- TRUE # Do it only once
+if (create_markers_table){
+  markers_all <- read.xlsx(here(dir,"data/1-s2.0-S2589004223009549-mmc5.xlsx"))
+  markers <- markers_all %>%
+    group_by(Cell.Population) %>%
+    slice_head(n = 10) %>%
+    aggregate(Gene.symbol ~ Cell.Population,
+              FUN = function(x) paste(x, collapse = ",")) %>%
+    mutate(tissueType = "Kidney", .before = 1) %>%
+    rename("cellName" = "Cell.Population",
+           "geneSymbolmore1" = "Gene.symbol") %>%
+    mutate(geneSymbolmore2 = NA,
+           shortName = cellName,
+           .after = "geneSymbolmore1")
+  write.xlsx(markers, file = "data/kidney_db.xlsx",
+             sheetName="Kidney", append=TRUE)
+
+  markers_filtered <- markers %>%
+    filter(!cellName %in% c("Asc-Vasa-Recta", "CD-Trans", "CNT", "CTAL",
+                            "DC", "DCT-CNT", "Desc-Vasa-Recta",
+                            "DTL", "DTL-ATL", "Fib",
+                            "Glom-Endo", "LOH", "MD", "MTAL", "PEC",
+                            "Vas-Afferens", "Vas-Efferens", "Unknown"))
+
+  write.xlsx(markers_filtered, file = "data/kidney_db_filtered.xlsx",
+             sheetName="Kidney", append=TRUE)
+}
+
+# Compute sctype annotation
+dbname <- "kidney_db_filtered"
+kidney_db <- here(dir, glue("data/{dbname}.xlsx"))
+
+seurat <- run_sctype(seurat, assay = "RNA", scaled = TRUE,
+                     known_tissue_type = tissue,
+                     custom_marker_file = kidney_db,
+                     name = dbname)
+seurat@meta.data[[dbname]] <- seurat@meta.data[[dbname]] %>% as.factor()
+
+DimPlot(seurat, group.by = dbname,
+        split.by = "orig.ident", label = TRUE) +
+  theme(legend.position = 'none')
+
+# Number of cells per annotation
+summary(seurat@meta.data[[dbname]] %>% as.factor())
+
+# Remove Unknown and re-annotate
+expr <- FetchData(seurat, vars = dbname)
+seurat <- seurat[, which(expr != "Unknown")]
+
+# Re-run seurat analysis
+seurat <- RunPCA(seurat, npcs = 50, verbose = T)
+seurat <- IntegrateLayers(object = seurat, method = CCAIntegration,
+                        orig.reduction = "pca", new.reduction = "integrated.cca",
+                        verbose = FALSE)
+
+# Re-join layers after integration
+seurat[["RNA"]] <- JoinLayers(seurat[["RNA"]])
+# to Re-split run:
+# seurat_kidneymarkers[["RNA"]] <- split(seurat_kidneymarkers[["RNA"]], f = seurat_kidneymarkers$orig.ident)
+
+seurat <- FindNeighbors(seurat,reduction = "integrated.cca", dims = 1:30)
+seurat <- FindClusters(seurat, resolution =  0.8)
+seurat <- RunUMAP(seurat, dims = 1:30, reduction = "integrated.cca")
+
+# Re-compute sctype annotation
+seurat <- run_sctype(seurat, assay = "RNA",
+                             scaled = TRUE,
+                              known_tissue_type = tissue,
+                              custom_marker_file = kidney_db,
+                              name = glue("{dbname}_2"))
+seurat@meta.data[[glue("{dbname}_2")]] <- seurat@meta.data[[glue("{dbname}_2")]] %>% as.factor()
+
+# Number of cells per annotation
+summary(seurat@meta.data[[glue("{dbname}_2")]] %>% as.factor())
+
+# Remove Unknown 
+expr <- FetchData(seurat, vars = glue("{dbname}_2"))
+seurat <- seurat[, which(expr != "Unknown")]
+
+DimPlot(seurat, group.by = glue("{dbname}_2"),
+        split.by = "orig.ident", label = TRUE) +
+  theme(legend.position = 'none')
+
+# Save results
+saveRDS(seurat,
+        here(dir, "rds", "WT_MT_ZK_seurat.rds"))
+```
+
+## Cell type markers
+
+The aim is to compute cell type markers.
+
+```{r}
+sapply(c(here(dir, "table", "deg"),
+         here(dir, "table", "pathway")),
+       FUN = function(x){dir.create(x, recursive = T)})
+
+dbname <- "kidney_db_filtered"
+seurat <- readRDS(here(dir, "rds", glue("WT_MT_ZK_seurat.rds")))
+
+seurat$CellType <- seurat@meta.data[[glue("{dbname}_2")]]
+
+DefaultAssay(seurat) <- "RNA"
+
+seurat$CellType <- droplevels(seurat$CellType)
+
+convert <- c("ATL" = "LOH",  "DCT" = "DCT",
+             "Endo" = "Endo",
+             "ICA" = "Glom", "ICB" = "Glom", "Per" = "Glom",
+             "Podo" = "Glom", "PC" = "Glom", "MC" = "Glom",
+             "PTS1" = "PT", "PTS2" = "PT", "PTS3" = "PT", "PTS3T2" = "PT",
+             "B lymph" = "Immune", "T lymph" = "Immune", "Macro" = "Immune",
+             "Neutro" = "Immune", "NK" = "Immune"
+             )
+
+levels(seurat$CellType) <- 
+  ifelse(levels(seurat$CellType) %in% names(convert),
+         convert[levels(seurat$CellType)],
+         levels(seurat$CellType))
+
+Idents(seurat) <- seurat$CellType
+
+DimPlot(seurat, split.by = "orig.ident", label = TRUE) +
+  theme(legend.position = 'none')
+
+saveRDS(seurat, here(dir, "rds", glue("WT_MT_ZK_seurat.rds")))
+
+###########################
+# Compute CellType markers
+###########################
+all_markers <- FindAllMarkers(seurat, only.pos = T)
+
+write.table(all_markers, file = here(dir, "table", "all_markers.txt"),
+            quote = FALSE, row.names = FALSE, sep = "\t")
+```
+
+## MT vs WT
+
+The aim is to compute DEG of conditions MT vs WT in each cell types, and the enriched pathway of PT cells.
+
+```{r}
+library(here)
+library(Seurat)
+library(glue)
+library(dplyr)
+library(ggplot2)
+source("fct_pathway.R")
+
+###########################
+# Compute DEGs for each CellType
+###########################
+
+treatment_sample <- "MT" 
+base_sample <- "WT"
+
+DEG <- list()
+
+for (celltype in unique(seurat$CellType)){
+  DEG[[celltype]] <- FindMarkers(seurat,
+                                 ident.1 = treatment_sample,
+                                 ident.2 = base_sample,
+                                 group.by = "orig.ident",
+                                 subset.ident = celltype)
+
+  write.table(DEG[[celltype]] %>% tibble::rownames_to_column("gene"),
+      file = here(dir, "table", "deg",
+                 glue("deg_", 
+                      gsub("\\W", "_", celltype),
+                      "_{treatment_sample}vs{base_sample}.txt")),
+      quote = FALSE, row.names = FALSE, sep = "\t")
+}
+
+###########################
+# Compute pathways of DEGs
+###########################
+
+# Compute enrichment
+OPT <- list()
+OPT$comparison <- list()
+
+term <- terms$All # terms is defined in fct_pathway.R file
+celltype <- "PT"
+
+# Compute ordered geneList
+geneList <- DEG[[celltype]] %>%
+  mutate(metric = avg_log2FC) %>%
+  arrange(desc(metric)) %>%
+  # deals with Inf numbers
+  dplyr::mutate(metric = ifelse(is.finite(metric), metric,
+                                .Machine$double.xmax * sign(metric))) %>%
+  dplyr::select(metric) %>%
+  tibble::rownames_to_column() %>%
+  tibble::deframe()
+
+OPT$comparison[[glue("GSEA {celltype} {term$name}")]] <- list(
+  name = glue("GSEA {celltype} {term$name}"),
+  term = terms[[term$name]],
+  method = "GSEA",
+  GSEA = list(geneList = geneList),
+  pairwise_termsim = list(method = "JC")
+)
+
+OPT$comparison <- lapply(OPT$comparison, function(x){
+  x$gsea_res <- pipeline_enrichment(x)
+  return(x)
+})
+
+# Save results as tsv
+lapply(OPT$comparison, function(x){
+  file <- here(dir, "table", "pathway", glue("gsea_", gsub("\\W", "_", x$name), "_{treatment_sample}vs{base_sample}.tsv"))
+  write.table(x$gsea_res, file,
+              sep='\t', quote = FALSE, na = '', dec = ',', row.names = FALSE)
+})
+
+```
+
+## ZK vs MT
+
+The aim is to compute DEG of conditions ZK vs MT in each cell types, and the enriched pathway of PT cells.
+
+```{r}
+library(here)
+library(Seurat)
+library(glue)
+library(dplyr)
+library(ggplot2)
+source("fct_pathway.R")
+
+###########################
+# Compute DEGs for each CellType
+###########################
+
+treatment_sample <- "ZK" 
+base_sample <- "MT"
+
+DEG <- list()
+
+for (celltype in unique(seurat$CellType)){
+  DEG[[celltype]] <- FindMarkers(seurat,
+                                 ident.1 = treatment_sample,
+                                 ident.2 = base_sample,
+                                 group.by = "orig.ident",
+                                 subset.ident = celltype)
+
+  write.table(DEG[[celltype]] %>% tibble::rownames_to_column("gene"),
+      file = here(dir, "table", "deg",
+                 glue("deg_", 
+                      gsub("\\W", "_", celltype),
+                      "_{treatment_sample}vs{base_sample}.txt")),
+      quote = FALSE, row.names = FALSE, sep = "\t")
+}
+
+###########################
+# Compute pathways of DEGs
+###########################
+
+# Compute enrichment
+OPT <- list()
+OPT$comparison <- list()
+
+term <- terms$All # terms is defined in script/fct_pathway.R file
+
+celltype <- "PT"
+
+# Compute ordered geneList
+geneList <- DEG[[celltype]] %>%
+  mutate(metric = avg_log2FC) %>%
+  arrange(desc(metric)) %>%
+  # deals with Inf numbers
+  dplyr::mutate(metric = ifelse(is.finite(metric), metric,
+                                .Machine$double.xmax * sign(metric))) %>%
+  dplyr::select(metric) %>%
+  tibble::rownames_to_column() %>%
+  tibble::deframe()
+
+OPT$comparison[[glue("GSEA {celltype} {term$name}")]] <- list(
+  name = glue("GSEA {celltype} {term$name}"),
+  term = terms[[term$name]],
+  method = "GSEA",
+  GSEA = list(geneList = geneList),
+  pairwise_termsim = list(method = "JC")
+)
+
+
+OPT$comparison <- lapply(OPT$comparison, function(x){
+  x$gsea_res <- pipeline_enrichment(x)
+  return(x)
+})
+
+# Save results as tsv
+lapply(OPT$comparison, function(x){
+  file <- here(dir, "table", "pathway", glue("gsea_", gsub("\\W", "_", x$name), "_{treatment_sample}vs{base_sample}.tsv"))
+  write.table(x$gsea_res, file,
+              sep='\t', quote = FALSE, na = '', dec = ',', row.names = FALSE)
+})
+
+```
+
+## CellChat
+
+The aim is to run CellChat comparison analysis on MT and WT samples.
+
+```{r}
+library(CellChat)
+library(future)
+options(future.seed=TRUE)
+
+seurat <- readRDS(here(dir, "rds", glue("WT_MT_ZK_seurat.rds")))
+
+# Initialisation of db
+CellChatDB <- CellChatDB.mouse # use CellChatDB.mouse if running on mouse data
+showDatabaseCategory(CellChatDB)
+CellChatDB.use <- subsetDB(CellChatDB, search = "Secreted Signaling", key = "annotation") 
+
+# Create individual WT and MT CellChat objects
+samples <- list("WT" = "WT", "MT" = "MT")
+
+cellchat_list <- lapply(samples, function(x){
+  # Initialisation of seurat object
+  seurat.subset <- subset(seurat, subset = orig.ident == x)
+
+  data.input <- seurat.subset[["RNA"]]$data # normalized data matrix
+  # For Seurat version >= “5.0.0”, get the normalized data via `seurat_object[["RNA"]]$data`
+  labels <- Idents(seurat.subset)
+  meta <- data.frame(group = labels, row.names = names(labels)) # create a dataframe of the cell labels
+
+  cellchat <- createCellChat(object = seurat.subset, group.by = "CellType", assay = "RNA")
+
+  #cellchat <- addMeta(cellchat, meta = meta, meta.name = "labels")
+  #cellchat <- setIdent(cellchat, ident.use = "labels") # set "labels" as default cell identity
+  #levels(cellchat@idents) # show factor levels of the cell labels
+  groupSize <- as.numeric(table(cellchat@idents))
+
+  cellchat@DB <- CellChatDB.use
+
+  # subset the expression data of signaling genes for saving computation cost
+  cellchat <- subsetData(cellchat) # This step is necessary even if using the whole database
+
+  future::plan("multisession", workers = 4) # do parallel
+  options(future.seed=TRUE)
+
+  cellchat <- identifyOverExpressedGenes(cellchat, do.fast = FALSE,
+                                         thresh.pc = 0.1, thresh.fc = 0.1)
+  cellchat <- identifyOverExpressedInteractions(cellchat)
+  cellchat <- computeCommunProb(cellchat, type = "triMean")
+
+  cellchat <- filterCommunication(cellchat, min.cells = 10)
+
+  # Infer the cell-cell communication at a signaling pathway level
+  cellchat <- computeCommunProbPathway(cellchat)
+
+  # Calculate the aggregated cell-cell communication network
+  cellchat <- aggregateNet(cellchat)
+  cellchat <- netAnalysis_computeCentrality(cellchat)
+  return(cellchat)
+})
+
+# Extract the inferred cellular communication network as a data frame
+df.net <- subsetCommunication(cellchat_list$WT)
+DT::datatable(df.net)
+
+# Extract the inferred cellular communication network as a data frame
+df.net <- subsetCommunication(cellchat_list$MT)
+DT::datatable(df.net)
+
+# Merge objects
+cellchat <- mergeCellChat(cellchat_list, add.names = names(cellchat_list))
+
+cellchat@netP$WT$pathways
+cellchat@netP$MT$pathways
+
+#  Circle plot showing differential number of interactions or interaction strength among different cell populations across two datasets
+netVisual_diffInteraction(cellchat, weight.scale = T, measure = "count")
+
+# Circle plot showing the number of interactions or interaction strength among different cell populations across multiple datasets
+weight.max <- getMaxWeight(cellchat_list, attribute = c("idents","count"))
+for (i in 1:length(cellchat_list)) {
+  netVisual_circle(cellchat_list[[i]]@net$count, weight.scale = T, label.edge= T, edge.weight.max = weight.max[2], edge.width.max = 12)
+  title(paste0("Number of interactions - ", names(cellchat_list)[i]))
+}
+
+saveRDS(cellchat, file = here(dir, "rds", "cellchat_merged.rds"))
+```
