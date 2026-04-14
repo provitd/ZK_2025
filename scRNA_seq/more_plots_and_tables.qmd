@@ -1,0 +1,266 @@
+---
+title: "more plots and tables"
+format: html
+toc: true
+---
+
+# Set up
+
+```{r}
+library(here)
+library(glue)
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(Seurat)
+source(here("utils/fct_pathway.R"))
+
+dir <- "scRNA_seq"
+result <- "result/"
+
+# Create directories
+directories <- c(here(dir, result, "figure"), here(dir, result, "table"))
+sapply(directories, function(x){dir.create(x, showWarnings = FALSE, recursive = TRUE)})
+
+```
+
+## Load data 
+
+
+```{r}
+# Load object
+seurat <- readRDS(here("scRNA_seq", "260401_revision_scRNA_seq_GL", "rds", glue("WT_MT_ZK_seurat.rds")))
+
+# Load DGE 
+comparison <- "ZKvsMT"
+metadata_key <- "CellType_2"
+
+DEG <- list()
+deg_dir <- here(dir, "260401_revision_scRNA_seq_GL", "table", glue("deg_{metadata_key}_{comparison}"))
+
+for (celltype in c("PT", "CNT_DCT")){
+  celltype <- gsub("\\W", "_", celltype)
+  DEG[[celltype]] <- read.csv(here(deg_dir,
+                                          glue("deg_{celltype}_{comparison}.txt")),
+                                header=TRUE, sep = "\t")
+}
+
+# Load pathway
+pathway_dir <- here(dir, "260401_revision_scRNA_seq_GL", "table", glue("pathway_{metadata_key}_ZKvsMT"))
+
+pathway_PT <- read.csv(here(pathway_dir, "gsea_GSEA_PT_All_ZKvsMT_pvalcutoff_1.tsv"), sep='\t', header = TRUE)
+pathway_DCT <- read.csv(here(pathway_dir, "gsea_GSEA_CNT_DCT_All_ZKvsMT_pvalcutoff_1.tsv") , sep='\t', header = TRUE)
+
+```
+
+## Heatmap 
+
+Heatmap of the genes involved in VitaminD receptor Pathway in PT ir CNT_DCT cells. The color corresponds to the fold change. The row corresponds to the CellType and the orig.ident
+
+```{r}
+# Prendre tous ceux de la liste du pathway et ordonner en fonction du logfc 
+
+genes_PT <- pathway_PT %>%
+  filter(ID == "WP_VITAMIN_D_RECEPTOR_PATHWAY") %>%
+  pull(core_enrichment) %>%
+  stringr::str_split(pattern = "/") %>% 
+  first()
+genes_DCT <- pathway_DCT %>%
+  filter(ID == "WP_VITAMIN_D_RECEPTOR_PATHWAY") %>%
+  pull(core_enrichment) %>%
+  stringr::str_split(pattern = "/") %>% 
+  first()
+VitD_gene <- terms$All$dict$TERM2GENE %>% filter(TERM == "WP_VITAMIN_D_RECEPTOR_PATHWAY") %>% pull(GENE)
+
+genes_to_keep <- unique(c(genes_PT, genes_DCT, VitD_gene))
+genes_to_keep <- intersect(genes_to_keep, Features(seurat))
+
+# Create seurat with only MT ZK and PT CNT/DCT
+seurat_subset <- subset(seurat, orig.ident %in% c('MT', 'ZK'))
+seurat_subset <- subset(seurat_subset, CellType_2 %in% c('PT', 'CNT/DCT'))
+seurat_subset$celltype_orig_ident <- paste(seurat_subset$CellType_2, seurat_subset$orig.ident, sep="_")
+seurat_subset$celltype_orig_ident <- as.factor(seurat_subset$celltype_orig_ident)
+
+Idents(seurat_subset) <- seurat_subset$celltype_orig_ident
+
+seurat_aggr <- AggregateExpression(seurat_subset, 
+                    features = genes_to_keep,
+                     return.seurat = TRUE)
+
+seurat_aggr <- ScaleData(seurat_aggr, features=genes_to_keep)
+
+DoHeatmap(seurat_aggr, features = genes_to_keep)
+
+matrix <- GetAssayData(seurat_aggr, layer="scale.data") %>% 
+  as.matrix() %>% 
+  t() 
+matrix <- matrix[,colSums(abs(matrix)) != 0]
+
+annotation_row = seurat_aggr@meta.data %>% 
+  tidyr::separate(col = "orig.ident", sep='-', into = c("CellType_2", "orig.ident"))
+labels_col = ifelse(Features(seurat_aggr) %in% c(genes_DCT, genes_PT), 
+                        Features(seurat_aggr), "")
+
+setEPS()
+postscript(here(dir, result, "figure/heatmap_VITD_pathway.eps"))
+# produce the desired graph(s)
+pheatmap::pheatmap(matrix, 
+                   annotation_row = annotation_row, 
+                   #annotation_col = annotation_col, 
+                   show_rownames = FALSE, 
+                   treeheight_row = 0, 
+                   treeheight_col = 0, 
+                   labels_col = labels_col, 
+                   fontsize_col = 6, 
+                   border_color= NA,
+                   main = "Scaled expr of WP_VITAMIN_D_RECEPTOR_PATHWAY genes, ones annotated are core_enrichment ZKvsMT in PT or DCT", 
+                   color = colorRampPalette(c("yellow", "#E6DF79", "#BEBCBA", "#916EE0", "blue"))(100),
+                   fontsize = 10
+                   )
+
+dev.off()  
+
+my_plot <- gridExtra::grid.arrange(p, nrow=1, ncol=1)
+ggsave(filename=here(dir, result, "figure/my_pheatmap.svg"), plot=p)
+
+```
+
+## VennDiagramm
+
+```{r}
+table <- list()
+genes <- list()
+for (SRR in c("SRR19796135", "SRR19796266", "SRR19796267")){
+  table[[SRR]] <- read.csv((here(glue("data/ChIPseq/{SRR}.txt"))), 
+                            sep='\t', header=TRUE)
+
+  
+  genes[[SRR]] <- table[[SRR]] %>% 
+    filter(Peak.Score > 20) %>%
+    pull(Gene.Name)
+}
+common_genes <- intersect(genes$SRR19796267, intersect(genes$SRR19796135, genes$SRR19796266))
+
+DEG_PT_genes <- DEG$PT %>% 
+  filter(p_val_adj < 0.05, abs(avg_log2FC) > 0.58) %>%
+  pull(gene)
+
+venn_genes <- list("ChIP_VDR" = common_genes, 
+                   "DEGs_PT" = DEG_PT_genes)
+
+ggvenn::ggvenn(venn_genes, c("ChIP_VDR", "DEGs_PT"), 
+               show_percentage = TRUE)
+ggsave(here(dir, result, "figure/venn_ChIPVDR_DEGPT_pct.eps"))
+ggvenn::ggvenn(venn_genes, c("ChIP_VDR", "DEGs_PT"), 
+               show_percentage = FALSE)
+ggsave(here(dir, result, "figure/venn_ChIPVDR_DEGPT.eps"))
+
+```
+
+## Enrichment of intersection ChIP_VDR and DEGs_PT
+
+```{r}
+# Compute enrichment
+OPT <- list()
+OPT$comparison <- list()
+
+term <- terms$All # terms is defined in fct_pathway.R file
+
+for (celltype in c("PT")){
+  # Compute ordered geneList
+  geneList <- DEG[[celltype]] %>%
+    filter(gene %in% intersect(venn_genes$ChIP_VDR, venn_genes$DEGs_PT)) %>%
+    tibble::column_to_rownames("gene") %>%
+    mutate(metric = avg_log2FC) %>%
+    arrange(desc(metric)) %>%
+    # deals with Inf numbers
+    dplyr::mutate(metric = ifelse(is.finite(metric), metric,
+                                  .Machine$double.xmax * sign(metric))) %>%
+    dplyr::select(metric) %>%
+    tibble::rownames_to_column() %>%
+    tibble::deframe()
+  
+  OPT$comparison[[glue("GSEA intersect_CHIP_DGEPT {celltype} {term$name}")]] <- list(
+    name = glue("GSEA intersect_CHIP_DGEPT {celltype} {term$name}"),
+    term = terms[[term$name]],
+    method = "GSEA",
+    GSEA = list(geneList = geneList, pvalueCutoff = 1),
+    pairwise_termsim = list(method = "JC")
+  )
+}
+  
+OPT$comparison <- lapply(OPT$comparison, function(x){
+  x$gsea_res <- pipeline_enrichment(x)
+  return(x)
+})
+
+# Save results as tsv
+pathway_dir <- here(dir, result, "table", glue("pathway_{metadata_key}_ZKvsMT"))
+dir.create(pathway_dir, showWarnings = FALSE, recursive = TRUE)
+
+lapply(OPT$comparison, function(x){
+  file <- here(pathway_dir, glue("gsea_", gsub("\\W", "_", x$name), "_ZKvsMT_pvalcutoff_1.tsv"))
+  write.table(x$gsea_res, file,
+              sep='\t', quote = FALSE, na = '', dec = ',', row.names = FALSE)
+})
+
+```
+
+## ViolinPlot
+
+```{r}
+VlnPlot(seurat, features = c("Cyp27b1"), group.by = "orig.ident") + 
+  RotatedAxis() + ggtitle('Cyp27b1 in all cells')
+ggsave(here(dir, result, "figure/Cyp27b1_all_cells.eps"), 
+       height=4, width=4)
+
+VlnPlot(seurat, features = c("Arg2"), group.by = "orig.ident") + 
+  RotatedAxis() + ggtitle('Arg2 in all cells')
+ggsave(here(dir, result, "figure/Arg2_all_cells.eps"), 
+       height=4, width=4)
+
+
+seurat_PT <- subset(seurat, CellType_2 == "PT")
+
+VlnPlot(seurat_PT, features = c("Cyp27b1"), group.by = "orig.ident") + 
+  RotatedAxis() + ggtitle('Cyp27b1 in PT cells')
+ggsave(here(dir, result, "figure/Cyp27b1_PT_cells.pdf"), 
+       height=4, width=4)
+
+VlnPlot(seurat_PT, features = c("Arg2"), group.by = "orig.ident") + 
+  RotatedAxis() + ggtitle('Arg2 in PT cells')
+ggsave(here(dir, result, "figure/Arg2_PT_cells.pdf"), 
+       height=4, width=4)
+
+```
+
+## Table number of cell by cluster by condition
+
+```{r}
+summary <- list()
+for (key in c("seurat_clusters", "CellType", "CellType_2")){
+  summary[[key]] <- seurat@meta.data %>% 
+    dplyr::group_by(orig.ident, !!as.name(key)) %>%
+    dplyr::summarise(n = n())
+  write.table(summary[[key]], 
+              here(dir, result, "table", glue("count_{key}_summary.tsv")),
+              sep='\t', quote = FALSE, 
+              na = '', dec = ',', row.names = FALSE)
+  
+   write.table(summary[[key]] %>% 
+    tidyr::pivot_wider(names_from = "orig.ident", 
+                       values_from = "n"),
+              here(dir, result, "table", glue("count_{key}_summary_wider.tsv")),
+              sep='\t', quote = FALSE, 
+              na = '', dec = ',', row.names = FALSE)
+}
+```
+
+
+
+# `sessionInfo()`
+
+```{r}
+sessionInfo()
+```
+

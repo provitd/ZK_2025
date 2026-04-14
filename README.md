@@ -9,7 +9,7 @@ This directory contains scripts of the bioinformatic analysis of the paper (...)
 
 The analysis is separated into different folders:
 - [RNA_seq](RNA_seq/): analysis of femur and kidney RNA-seq datasets using [DESeq2](https://github.com/thelovelab/DESeq2)
-- [scRNA_seq](scRNA_seq/): analysis of kidney scRNA-seq dataset using [Seurat](https://github.com/satijalab/seurat) and [CellChat](https://github.com/jinworks/CellChat)
+- [scRNA_seq](scRNA_seq/): analysis of kidney scRNA-seq dataset using [Seurat](https://github.com/satijalab/seurat), [DoubletFinder](https://github.com/chris-mcginnis-ucsf/DoubletFinder) and [CellChat](https://github.com/jinworks/CellChat)
   
 
 The files in [utils](utils/) directory contain R scripts with general functions for the analysis:
